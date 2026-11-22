@@ -22,6 +22,8 @@ To bring history forward, sample the previous frame at ``(x - dx, y - dy)``
 (bilinear reverse sampling), never at ``(x + dx, y + dy)``.
 """
 
+import math
+
 __all__ = [
     "jitter",
     "reproject",
@@ -54,7 +56,30 @@ def jitter(index: int, samples: int) -> tuple:
     tolerance ``1e-9``.  Raise ``ValueError`` for ``index < 0`` or
     ``samples < 1``.
     """
-    raise NotImplementedError("jitter")
+    if index < 0:
+        raise ValueError("index must be non-negative")
+    if samples < 1:
+        raise ValueError("samples must be positive")
+
+    # Radical-inverse (van der Corput) sequences in bases 2 and 3.  The
+    # global frame index is offset by one so that frame zero still gets a
+    # non-degenerate phase.  Halton phases are aperiodic for all practical
+    # frame counts, so there is no eight-frame cycle to beat against a
+    # 60 Hz display, and the whole sequence is deterministic.
+    def _van_der_corput(n: int, base: int) -> float:
+        result = 0.0
+        denom = 1.0
+        while n > 0:
+            n, digit = divmod(n, base)
+            denom *= base
+            result += digit / denom
+        return result
+
+    hx = _van_der_corput(index + 1, 2)
+    hy = _van_der_corput(index + 1, 3)
+    # Map (0, 1) onto (-1, 1); the endpoints are never reached, so the
+    # amplitude is strictly below one pixel.
+    return (2.0 * hx - 1.0, 2.0 * hy - 1.0)
 
 
 def reproject(history: list, motion: list) -> list:
@@ -73,7 +98,60 @@ def reproject(history: list, motion: list) -> list:
     "weight": 0.0}``.  A zero motion field must reproduce the input
     history exactly to tolerance ``1e-9``.  All weights stay in ``[0, 1]``.
     """
-    raise NotImplementedError("reproject")
+    height = len(history)
+    width = len(history[0]) if height else 0
+
+    def _lookup(sx: float, sy: float) -> tuple:
+        """Bilinearly sample history at (sx, sy); out-of-grid is empty."""
+        x0 = math.floor(sx)
+        y0 = math.floor(sy)
+        fx = sx - x0
+        fy = sy - y0
+        color_acc = 0.0
+        depth_acc = 0.0
+        weight_acc = 0.0
+        for oy, wy in ((y0, 1.0 - fy), (y0 + 1, fy)):
+            if wy == 0.0:
+                continue
+            if oy < 0 or oy >= height:
+                continue  # do not clamp: outside contributes nothing
+            row = history[oy]
+            if x0 >= 0 and x0 < width and (1.0 - fx) != 0.0:
+                rec = row[x0]
+                w = (1.0 - fx) * wy
+                wc = rec["weight"]
+                color_acc += w * wc * rec["color"]
+                depth_acc += w * wc * rec["depth"]
+                weight_acc += w * wc
+            if fx != 0.0 and x0 + 1 >= 0 and x0 + 1 < width:
+                rec = row[x0 + 1]
+                w = fx * wy
+                wc = rec["weight"]
+                color_acc += w * wc * rec["color"]
+                depth_acc += w * wc * rec["depth"]
+                weight_acc += w * wc
+        if weight_acc <= 0.0:
+            return {"color": 0.0, "depth": 0.0, "weight": 0.0}
+        return {
+            "color": color_acc / weight_acc,
+            "depth": depth_acc / weight_acc,
+            "weight": weight_acc,
+        }
+
+    out = []
+    for y in range(height):
+        out_row = []
+        for x in range(width):
+            dx, dy = motion[y][x]
+            # Reverse sampling: fetch the previous frame at (x - dx, y - dy).
+            sample = _lookup(x - dx, y - dy)
+            out_row.append({
+                "color": sample["color"],
+                "depth": sample["depth"],
+                "weight": sample["weight"],
+            })
+        out.append(out_row)
+    return out
 
 
 def validate_history(history: list, depth: list, motion: list) -> list:
@@ -92,7 +170,31 @@ def validate_history(history: list, depth: list, motion: list) -> list:
     The comparison tolerance is ``1e-9``.  Weights and booleans are not
     floating-point colours, so no extra normalisation is performed here.
     """
-    raise NotImplementedError("validate_history")
+    out = []
+    for y, hist_row in enumerate(history):
+        row = []
+        for x, rec in enumerate(hist_row):
+            hw = rec["weight"]
+            hd = rec["depth"]
+            cd = depth[y][x]
+            dx, dy = motion[y][x]
+            ok = True
+            if not (hw > WEIGHT_EPS):
+                ok = False
+            if not (math.isfinite(hw) and math.isfinite(hd)
+                    and math.isfinite(cd) and math.isfinite(dx)
+                    and math.isfinite(dy)):
+                ok = False
+            if not (hd > 0.0 and cd > 0.0):
+                ok = False
+            # Relative depth test: scales correctly for near and far pixels.
+            if abs(hd - cd) > DEPTH_REL_TOL * max(hd, cd) + 1e-6:
+                ok = False
+            if math.hypot(dx, dy) > MOTION_LIMIT:
+                ok = False
+            row.append(ok)
+        out.append(row)
+    return out
 
 
 def blend(cur: list, hist: list, alpha_map: list) -> list:
@@ -105,7 +207,15 @@ def blend(cur: list, hist: list, alpha_map: list) -> list:
     let their sum drift away from one.  Floats are compared with
     tolerance ``1e-9``.
     """
-    raise NotImplementedError("blend")
+    out = []
+    for y, cur_row in enumerate(cur):
+        row = []
+        for x, c in enumerate(cur_row):
+            a = alpha_map[y][x]
+            # Per-pixel normalisation: the two weights sum to exactly one.
+            row.append(a * c + (1.0 - a) * hist[y][x]["color"])
+        out.append(row)
+    return out
 
 
 def accumulate(history: list, cur: list, motion: list, depth: list,
@@ -131,7 +241,54 @@ def accumulate(history: list, cur: list, motion: list, depth: list,
     ``new_depth`` to tolerance ``1e-9``.  All weights are in ``[0, 1]``
     and the returned grids keep the input shape.
     """
-    raise NotImplementedError("accumulate")
+    frame_index = config["frame_index"]
+    total_frames = config["total_frames"]
+    hist_weight = converge_weight(frame_index, total_frames)
+    cur_weight = 1.0 - hist_weight
+
+    reprojected = reproject(history, motion)
+    usable = validate_history(reprojected, depth, motion)
+
+    new_history = []
+    new_depth = []
+    for y in range(len(cur)):
+        hist_row = []
+        depth_row = []
+        for x in range(len(cur[y])):
+            c = cur[y][x]
+            d = depth[y][x]
+            h = reprojected[y][x]
+            # A record with no stored weight has never been initialised
+            # (first frame, or just after a camera cut).
+            was_initialised = history[y][x]["weight"] > WEIGHT_EPS
+            if usable[y][x]:
+                # Same weights for colour, depth and weight so the three
+                # pieces of history state stay in sync.
+                new_color = cur_weight * c + hist_weight * h["color"]
+                new_depth_value = cur_weight * d + hist_weight * h["depth"]
+                hist_weight_out = 1.0
+            elif not was_initialised:
+                # Uninitialised pixel: seed it fully from the current frame
+                # so the next frame has usable history to accumulate onto.
+                new_color = c
+                new_depth_value = d
+                hist_weight_out = 1.0
+            else:
+                # Invalid, already-initialised history contributes exactly
+                # zero: seed from the current frame with no history weight,
+                # so no ghost survives into the blend.
+                new_color = c
+                new_depth_value = d
+                hist_weight_out = 0.0
+            hist_row.append({
+                "color": new_color,
+                "depth": new_depth_value,
+                "weight": hist_weight_out,
+            })
+            depth_row.append(new_depth_value)
+        new_history.append(hist_row)
+        new_depth.append(depth_row)
+    return new_history, new_depth
 
 
 def reset_on_cut(history: list, cut_flags: list) -> list:
@@ -144,7 +301,22 @@ def reset_on_cut(history: list, cut_flags: list) -> list:
     Floating-point values use tolerance ``1e-9`` and weights stay in
     ``[0, 1]``.
     """
-    raise NotImplementedError("reset_on_cut")
+    out = []
+    for y, hist_row in enumerate(history):
+        row = []
+        for x, rec in enumerate(hist_row):
+            if cut_flags[y][x]:
+                # Reset colour, depth and weight together: a record whose
+                # depth survives a cut poisons the next frame's validation.
+                row.append({"color": 0.0, "depth": 0.0, "weight": 0.0})
+            else:
+                row.append({
+                    "color": rec["color"],
+                    "depth": rec["depth"],
+                    "weight": rec["weight"],
+                })
+        out.append(row)
+    return out
 
 
 def converge_weight(frame_index: int, total: int) -> float:
@@ -158,7 +330,13 @@ def converge_weight(frame_index: int, total: int) -> float:
     it with tolerance ``1e-9``.  Raise ``ValueError`` for a negative
     frame index or a non-positive total.
     """
-    raise NotImplementedError("converge_weight")
+    if frame_index < 0:
+        raise ValueError("frame_index must be non-negative")
+    if total <= 0:
+        raise ValueError("total must be positive")
+    if frame_index >= total:
+        return 1.0
+    return 1.0 - 1.0 / (frame_index + 1)
 
 
 def validate_state(history: list, depth: list) -> list[str]:
@@ -175,4 +353,55 @@ def validate_state(history: list, depth: list) -> list[str]:
     the reported diagnostic is not a floating-point colour, so a
     tolerance of ``1e-9`` is only relevant at the weight boundaries.
     """
-    raise NotImplementedError("validate_state")
+    problems = []
+
+    if not history:
+        problems.append("history is empty: size must be non-zero")
+        return problems
+    if not depth:
+        problems.append("depth is empty: size must be non-zero")
+        return problems
+
+    hist_h = len(history)
+    hist_w = len(history[0]) if hist_h else 0
+    depth_h = len(depth)
+    depth_w = len(depth[0]) if depth_h else 0
+
+    for y, row in enumerate(history):
+        if len(row) != hist_w:
+            problems.append(f"history row {y} has wrong size")
+            break
+    for y, row in enumerate(depth):
+        if len(row) != depth_w:
+            problems.append(f"depth row {y} has wrong size")
+            break
+    if not problems and (hist_h, hist_w) != (depth_h, depth_w):
+        problems.append(
+            f"history shape {hist_h}x{hist_w} does not match "
+            f"depth shape {depth_h}x{depth_w}: size/shape mismatch")
+
+    for y, row in enumerate(history):
+        for x, rec in enumerate(row):
+            for key in ("color", "depth", "weight"):
+                value = rec[key]
+                if not math.isfinite(value):
+                    problems.append(
+                        f"history[{y}][{x}].{key} is not finite (NaN/inf)")
+            w = rec["weight"]
+            if math.isfinite(w) and not (-TOL <= w <= 1.0 + TOL):
+                problems.append(
+                    f"history[{y}][{x}] weight {w} outside [0, 1]")
+
+    for y, row in enumerate(depth):
+        for x, value in enumerate(row):
+            if not math.isfinite(value):
+                problems.append(f"depth[{y}][{x}] is not finite (NaN/inf)")
+
+    if not problems:
+        total_weight = sum(rec["weight"] for row in history for rec in row)
+        pixels = hist_h * hist_w
+        if total_weight > pixels + TOL:
+            problems.append(
+                f"weight sum {total_weight} exceeds pixel count {pixels}")
+
+    return problems
